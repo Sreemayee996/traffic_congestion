@@ -54,6 +54,28 @@ if missing_columns:
     print(df.columns.tolist())
     raise ValueError("Please update the column names in the code.")
 
+# Keep the human-readable names too (if present in the raw data), so
+# reports/dashboards can display "Indiranagar / 100ft Road" instead of
+# just raw ID codes like "AREA01" / "RIN01".
+NAME_COLUMNS_AVAILABLE = []
+if "Area Name" in df.columns:
+    NAME_COLUMNS_AVAILABLE.append("Area Name")
+else:
+    print("\nWARNING: 'Area Name' column not found in raw data — "
+          "output will only have Area_ID, no readable area name.")
+
+if "Road/Intersection Name" in df.columns:
+    NAME_COLUMNS_AVAILABLE.append("Road/Intersection Name")
+else:
+    print("\nWARNING: 'Road/Intersection Name' column not found in raw data — "
+          "output will only have Intersection_ID, no readable road name.")
+
+if "Date" in df.columns:
+    NAME_COLUMNS_AVAILABLE.append("Date")
+else:
+    print("\nWARNING: 'Date' column not found in raw data — "
+          "trend charts over time won't be available in the dashboard.")
+
 print("Unique intersections in dataset:", df["Intersection_ID"].nunique())
 
 numeric_columns = [
@@ -263,6 +285,7 @@ df["Phase_2_Flow_Ratio"] = (df["Phase_2_Flow"] / df["Saturation_Flow"]).round(4)
 
 webster_columns = [
     "Area_ID", "Intersection_ID",
+] + NAME_COLUMNS_AVAILABLE + [
     "Traffic_Volume", "Road_Capacity_Utilization_Pct", "Estimated_Road_Capacity",
     "Average_Speed", "Travel_Time_Index", "Congestion_Level", "Incident_Level",
     "Capacity_Utilization", "Bottleneck_Status", "Speed_Condition",
@@ -281,3 +304,4 @@ OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 webster_input.to_csv(OUTPUT_FILE, index=False)
 
 print("\nSUCCESS! Rows:", len(webster_input))
+print("Columns included:", webster_input.columns.tolist())

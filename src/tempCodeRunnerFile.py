@@ -1,0 +1,1 @@
+    return float(pipeline.predict_proba(feature_row)[0, 1])
