@@ -5,6 +5,11 @@ High-level facade used by app.py. Loads + scores the data once,
 holds the trained ML models in memory, and exposes simple methods
 that map 1:1 onto the API endpoints. Keeping this orchestration out
 of app.py keeps the Flask layer thin (routing + HTTP concerns only).
+
+This version also loads Pipeline A's batch outputs (webster_results_full.csv
+and simulation_summary.csv) so the live API can serve the more accurate,
+pre-calculated Webster recommendations and full per-location detail,
+instead of only the simplified on-the-fly calculation in webster.py.
 """
 
 from __future__ import annotations
@@ -17,6 +22,10 @@ from . import ml_models, scoring, webster
 from .data_preprocessing import get_location_catalog, load_clean
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+WEBSTER_RESULTS_FILE = os.path.join(DATA_DIR, "webster_results_full.csv")
+BATCH_SUMMARY_FILE = os.path.join(DATA_DIR, "simulation_summary.csv")
+
 
 class TrafficAnalyzer:
     def __init__(self, csv_path: str, model_dir: str = MODEL_DIR, load_ml: bool = True):
@@ -31,6 +40,16 @@ class TrafficAnalyzer:
         self.risk_model = None
         if load_ml:
             self._try_load_ml()
+
+        # Pipeline A outputs (batch CSVs) — loaded once at startup, optional.
+        self.webster_results = self._load_csv_safely(WEBSTER_RESULTS_FILE)
+        self.batch_summary = self._load_csv_safely(BATCH_SUMMARY_FILE)
+
+    def _load_csv_safely(self, path: str):
+        try:
+            return pd.read_csv(path)
+        except FileNotFoundError:
+            return None
 
     def _try_load_ml(self) -> None:
         try:
@@ -52,6 +71,10 @@ class TrafficAnalyzer:
     @property
     def ml_ready(self) -> bool:
         return self.congestion_model is not None and self.risk_model is not None
+
+    @property
+    def batch_data_ready(self) -> bool:
+        return self.webster_results is not None and self.batch_summary is not None
 
     def list_locations(self) -> list[dict]:
         return self.location_catalog.to_dict(orient="records")
@@ -147,3 +170,98 @@ class TrafficAnalyzer:
             "predicted_congestion_score": round(congestion, 2),
             "predicted_high_accident_risk_probability": round(risk_proba, 3),
         }
+
+    # ------------------------------------------------------------------
+    # Pipeline A integration — batch/Webster results served through the
+    # live API, instead of sitting unused as CSV files.
+    # ------------------------------------------------------------------
+
+    def _match_webster_results(self, area_id: str, intersection_id: str) -> pd.DataFrame:
+        if self.webster_results is None:
+            raise RuntimeError(
+                "webster_results_full.csv not found. Run webster_preprocessing.py "
+                "then webster_batch.py first."
+            )
+        match = self.webster_results[
+            (self.webster_results["Area_ID"].astype(str).str.upper() == area_id.upper())
+            & (self.webster_results["Intersection_ID"].astype(str).str.upper() == intersection_id.upper())
+        ]
+        if match.empty:
+            raise ValueError(f"No batch Webster data for ({area_id}, {intersection_id}).")
+        return match
+
+    def location_full_detail(self, area_id: str, intersection_id: str) -> list[dict]:
+        """Returns every calculated column, every row (e.g. every day/record)
+        for one intersection from the Pipeline A batch results — full raw
+        detail, not a summary."""
+        match = self._match_webster_results(area_id, intersection_id)
+        return match.to_dict(orient="records")
+
+    def improved_signal_timing(self, area_id: str, intersection_id: str) -> dict:
+        """Signal timing recommendation using Pipeline A's properly
+        calculated lanes/saturation flow, instead of webster.py's
+        guessed defaults (num_phases=4, lanes_per_phase=2)."""
+        match = self._match_webster_results(area_id, intersection_id)
+        row = match.iloc[0]
+        return {
+            "area_id": row["Area_ID"],
+            "intersection_id": row["Intersection_ID"],
+            "estimated_lanes": row.get("Estimated_Lanes"),
+            "saturation_flow": row.get("Saturation_Flow"),
+            "webster_status": row.get("Webster_Status"),
+            "recommended_cycle_sec": row.get("Webster_Optimal_Cycle_Practical"),
+            "recommended_phase_1_green_sec": row.get("Webster_Phase_1_Green"),
+            "recommended_phase_2_green_sec": row.get("Webster_Phase_2_Green"),
+            "baseline_cycle_sec": row.get("Baseline_Cycle"),
+            "cycle_change_seconds": row.get("Cycle_Change_Seconds"),
+            "decision_priority": row.get("Decision_Priority"),
+        }
+
+    def batch_recommendation(self, area_id: str, intersection_id: str) -> dict:
+        """Before/after comparison for one intersection, using the
+        pre-computed summary from batch_report.py (simulation_summary.csv)."""
+        if self.batch_summary is None:
+            raise RuntimeError(
+                "simulation_summary.csv not found. Run webster_preprocessing.py, "
+                "webster_batch.py, then batch_report.py first."
+            )
+        match = self.batch_summary[
+            (self.batch_summary["Area_ID"].astype(str).str.upper() == area_id.upper())
+            & (self.batch_summary["Intersection_ID"].astype(str).str.upper() == intersection_id.upper())
+        ]
+        if match.empty:
+            raise ValueError(f"No batch summary for ({area_id}, {intersection_id}).")
+
+        row = match.iloc[0]
+        return {
+            "area_id": row["Area_ID"],
+            "intersection_id": row["Intersection_ID"],
+            "before": {
+                "congestion_score": row["Congestion_Score"],
+                "congestion_level": row["Most_Common_Congestion_Level"],
+                "bottleneck_rank": int(row["Bottleneck_Rank"]),
+                "bottleneck_index": row["Bottleneck_Index"],
+                "pct_severe_bottleneck_days": row["Pct_Severe_Bottleneck_Days"],
+            },
+            "after_recommendation": {
+                "cycle_length_sec": row["Recommended_Cycle_Length_Sec"],
+                "phase_1_green_sec": row["Recommended_Phase_1_Green_Sec"],
+                "phase_2_green_sec": row["Recommended_Phase_2_Green_Sec"],
+            },
+            "accident_risk_score": row["Accident_Risk_Score"],
+            "accident_risk_level": row["Accident_Risk_Level"],
+            "decision_priority": row["Most_Common_Decision_Priority"],
+        }
+
+    def bottleneck_ranking_batch(self, top_n: int = 10) -> list[dict]:
+        """Bottleneck ranking sourced from Pipeline A's batch summary
+        (based on the full historical dataset), as an alternative to
+        the live-computed scoring.bottleneck_ranking()."""
+        if self.batch_summary is None:
+            raise RuntimeError(
+                "simulation_summary.csv not found. Run webster_preprocessing.py, "
+                "webster_batch.py, then batch_report.py first."
+            )
+        top_n = max(1, min(top_n, len(self.batch_summary)))
+        ranked = self.batch_summary.sort_values("Bottleneck_Index", ascending=False).head(top_n)
+        return ranked.to_dict(orient="records")
