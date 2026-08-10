@@ -2,24 +2,6 @@
 app.py
 ------
 Flask REST API for the Bangalore Traffic Congestion backend.
-
-Endpoints
-~~~
-GET  /api/health
-GET  /api/locations
-GET  /api/congestion-score?area=<>&road=<>
-GET  /api/bottlenecks?top_n=<int>
-GET  /api/signal-timing?area=<>&road=<>&num_phases=<int>&lanes_per_phase=<int>
-GET  /api/accident-risk?area=<>&road=<>
-GET  /api/report?area=<>&road=<>                 (everything above, combined)
-GET  /api/predict?area=<>&road=<>&weather=<>&roadwork=<>&month=<>&day_of_week=<>
-POST /api/train                                   (re-train + persist ML models)
-
-Run:
-    python app.py
-Then e.g.:
-    curl "http://localhost:5000/api/locations"
-    curl "http://localhost:5000/api/report?area=Indiranagar&road=100%20Feet%20Road"
 """
 
 from __future__ import annotations
@@ -35,7 +17,6 @@ DATA_PATH = os.environ.get("TRAFFIC_DATA_PATH", "data/Banglore_traffic_Dataset W
 app = Flask(__name__)
 analyzer = TrafficAnalyzer(DATA_PATH)
 
-
 def _require_area_road():
     area = request.args.get("area")
     road = request.args.get("road")
@@ -44,10 +25,8 @@ def _require_area_road():
                                                 "See /api/locations for valid values."}), 400)
     return area, road, None
 
-
 def _handle_lookup_error(exc: Exception):
     return jsonify({"error": str(exc)}), 404
-
 
 @app.get("/api/health")
 def health():
@@ -58,11 +37,9 @@ def health():
         "ml_models_ready": analyzer.ml_ready,
     })
 
-
 @app.get("/api/locations")
 def locations():
     return jsonify(analyzer.list_locations())
-
 
 @app.get("/api/congestion-score")
 def congestion_score():
@@ -74,13 +51,11 @@ def congestion_score():
     except ValueError as e:
         return _handle_lookup_error(e)
 
-
 @app.get("/api/bottlenecks")
 def bottlenecks():
     top_n = request.args.get("top_n", default=10, type=int)
     top_n = max(1, min(top_n, 50))
     return jsonify(analyzer.bottlenecks(top_n=top_n))
-
 
 @app.get("/api/signal-timing")
 def signal_timing():
@@ -94,7 +69,6 @@ def signal_timing():
     except ValueError as e:
         return _handle_lookup_error(e)
 
-
 @app.get("/api/accident-risk")
 def accident_risk():
     area, road, err = _require_area_road()
@@ -105,7 +79,6 @@ def accident_risk():
     except ValueError as e:
         return _handle_lookup_error(e)
 
-
 @app.get("/api/report")
 def report():
     area, road, err = _require_area_road()
@@ -115,7 +88,6 @@ def report():
         return jsonify(analyzer.full_report(area, road))
     except ValueError as e:
         return _handle_lookup_error(e)
-
 
 @app.get("/api/predict")
 def predict():
@@ -134,12 +106,10 @@ def predict():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 409
 
-
 @app.post("/api/train")
 def train():
     metrics = analyzer.train_ml_models()
     return jsonify({"status": "trained", "metrics": metrics})
-
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)

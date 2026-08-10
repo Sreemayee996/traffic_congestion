@@ -1,419 +1,117 @@
-import pandas as pd
-import numpy as np
-from pathlib import Path
+"""
+webster.py
+----------
+Reusable Webster's method calculation, called on demand by
+simulation.py's TrafficAnalyzer for a single (area, road) at a time.
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+This is NOT the same as webster_preprocessing.py + webster_batch.py,
+which run the same underlying math as a batch over the whole dataset
+and write webster_input_full.csv / webster_results_full.csv for
+reporting. Both use the same core formula (C0 = (1.5L+5)/(1-Y)); this
+version just takes averaged traffic numbers for one location and
+returns a result object instead of writing a CSV.
 
-INPUT_FILE = BASE_DIR / "data" / "webster_input_full.csv"
-OUTPUT_FILE = BASE_DIR / "data" / "webster_results_full.csv"
+PROJECT ASSUMPTION: traffic demand is split evenly across all phases,
+since the dataset has no per-phase turning-movement data. Saturation
+flow is derived purely from intersection geometry (num_phases x
+lanes_per_phase), which the caller supplies -- not estimated from
+traffic volume like the batch pipeline does.
+"""
 
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+
+SATURATION_FLOW_PER_LANE = 1800
+LOST_TIME_PER_PHASE = 4
 MAX_PRACTICAL_CYCLE = 180
 
-def main():
+def _baseline_cycle_from_utilization(utilization_pct: float) -> int:
+    if utilization_pct >= 100:
+        return 120
+    elif utilization_pct >= 90:
+        return 100
+    elif utilization_pct >= 75:
+        return 80
+    else:
+        return 60
 
-    try:
-        df = pd.read_csv(INPUT_FILE)
+@dataclass
+class SignalTimingResult:
+    traffic_volume_vph: float
+    road_capacity_utilization_pct: float
+    num_phases: int
+    lanes_per_phase: int
+    saturation_flow_total: float
+    flow_ratio_per_phase: float
+    total_flow_ratio_y: float
+    webster_status: str
+    lost_time_seconds: int
+    baseline_cycle_seconds: int
+    optimal_cycle_seconds: float
+    cycle_capped: bool
+    available_green_seconds: float
+    green_per_phase_seconds: float
 
-    except FileNotFoundError:
-        raise FileNotFoundError(
-            f"\nInput file not found:\n{INPUT_FILE}\n"
-            "Please run data_preprocessing.py first."
-        )
+    def to_dict(self) -> dict:
+        return asdict(self)
 
-    print("\n" + "=" * 70)
-    print("WEBSTER SIGNAL TIMING CALCULATION")
-    print("=" * 70)
+def estimate_signal_timing(
+    traffic_volume_vph: float,
+    road_capacity_utilization_pct: float,
+    num_phases: int = 4,
+    lanes_per_phase: int = 2,
+) -> SignalTimingResult:
 
-    print("\nInput file loaded successfully.")
-    print("Total rows:", len(df))
+    if num_phases < 2:
+        raise ValueError("num_phases must be at least 2")
+    if lanes_per_phase < 1:
+        raise ValueError("lanes_per_phase must be at least 1")
 
-    required_columns = [
-        "Area_ID",
-        "Intersection_ID",
-        "Traffic_Volume",
-        "Phase_1_Flow",
-        "Phase_2_Flow",
-        "Phase_1_Flow_Ratio",
-        "Phase_2_Flow_Ratio",
-        "Saturation_Flow",
-        "Lost_Time",
-        "Baseline_Cycle"
-    ]
+    saturation_flow_per_phase = lanes_per_phase * SATURATION_FLOW_PER_LANE
+    saturation_flow_total = num_phases * saturation_flow_per_phase
 
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-        print("\nERROR: Missing columns:")
-        print(missing_columns)
-
-        print("\nAvailable columns:")
-        print(df.columns.tolist())
-
-        raise ValueError(
-            "Required Webster input columns are missing."
-        )
-
-    numeric_columns = [
-        "Traffic_Volume",
-        "Phase_1_Flow",
-        "Phase_2_Flow",
-        "Phase_1_Flow_Ratio",
-        "Phase_2_Flow_Ratio",
-        "Saturation_Flow",
-        "Lost_Time",
-        "Baseline_Cycle"
-    ]
-
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-
-    nan_rows = df[numeric_columns].isna().any(axis=1).sum()
-    if nan_rows > 0:
-        print(
-            f"\nWARNING: {nan_rows} row(s) have non-numeric or "
-            "missing values in required columns. These rows "
-            "will be marked INVALID_INPUT in the results."
-        )
-
-    if (df["Saturation_Flow"] <= 0).any():
-        raise ValueError(
-            "Saturation_Flow must be greater than 0."
-        )
-
-    if (df["Lost_Time"] < 0).any():
-        raise ValueError(
-            "Lost_Time cannot be negative."
-        )
-
-    df["Webster_Phase_1_Ratio"] = df["Phase_1_Flow_Ratio"]
-    df["Webster_Phase_2_Ratio"] = df["Phase_2_Flow_Ratio"]
-
-    df["Webster_Y"] = (
-        df["Webster_Phase_1_Ratio"] +
-        df["Webster_Phase_2_Ratio"]
+    phase_flow = traffic_volume_vph / num_phases
+    flow_ratio_per_phase = (
+        phase_flow / saturation_flow_per_phase if saturation_flow_per_phase > 0 else 0
     )
+    total_y = round(flow_ratio_per_phase * num_phases, 4)
 
-    df["Webster_Y"] = df["Webster_Y"].round(4)
+    lost_time = num_phases * LOST_TIME_PER_PHASE
+    baseline_cycle = _baseline_cycle_from_utilization(road_capacity_utilization_pct)
 
-    def check_webster_status(y):
+    if total_y <= 0:
+        webster_status = "NO_VALID_DEMAND"
+    elif total_y >= 1:
+        webster_status = "OVERSATURATED"
+    else:
+        webster_status = "VALID"
 
-        if pd.isna(y):
-            return "INVALID_INPUT"
+    if webster_status == "VALID":
+        raw_cycle = (1.5 * lost_time + 5) / (1 - total_y)
+        cycle_capped = raw_cycle > MAX_PRACTICAL_CYCLE
+        optimal_cycle = round(min(raw_cycle, MAX_PRACTICAL_CYCLE), 2)
+        available_green = round(optimal_cycle - lost_time, 2)
+        green_per_phase = round(available_green / num_phases, 2)
+    else:
+        cycle_capped = False
+        optimal_cycle = float("nan")
+        available_green = float("nan")
+        green_per_phase = float("nan")
 
-        elif y <= 0:
-            return "NO_VALID_DEMAND"
-
-        elif y >= 1:
-            return "OVERSATURATED"
-
-        else:
-            return "VALID"
-
-    df["Webster_Status"] = (
-        df["Webster_Y"].apply(check_webster_status)
+    return SignalTimingResult(
+        traffic_volume_vph=round(traffic_volume_vph, 1),
+        road_capacity_utilization_pct=round(road_capacity_utilization_pct, 1),
+        num_phases=num_phases,
+        lanes_per_phase=lanes_per_phase,
+        saturation_flow_total=saturation_flow_total,
+        flow_ratio_per_phase=round(flow_ratio_per_phase, 4),
+        total_flow_ratio_y=total_y,
+        webster_status=webster_status,
+        lost_time_seconds=lost_time,
+        baseline_cycle_seconds=baseline_cycle,
+        optimal_cycle_seconds=optimal_cycle,
+        cycle_capped=cycle_capped,
+        available_green_seconds=available_green,
+        green_per_phase_seconds=green_per_phase,
     )
-
-    df["Webster_Optimal_Cycle"] = np.where(
-        df["Webster_Status"] == "VALID",
-        (
-            (1.5 * df["Lost_Time"] + 5) /
-            (1 - df["Webster_Y"])
-        ),
-        np.nan
-    )
-
-    df["Webster_Optimal_Cycle"] = (
-        df["Webster_Optimal_Cycle"].round(2)
-    )
-
-    df["Webster_Cycle_Capped"] = (
-        df["Webster_Optimal_Cycle"] > MAX_PRACTICAL_CYCLE
-    )
-
-    df["Webster_Optimal_Cycle_Practical"] = np.where(
-        df["Webster_Cycle_Capped"],
-        MAX_PRACTICAL_CYCLE,
-        df["Webster_Optimal_Cycle"]
-    )
-
-    df["Webster_Available_Green"] = np.where(
-        df["Webster_Status"] == "VALID",
-        (
-            df["Webster_Optimal_Cycle_Practical"] -
-            df["Lost_Time"]
-        ),
-        np.nan
-    )
-
-    df["Webster_Available_Green"] = (
-        df["Webster_Available_Green"].round(2)
-    )
-
-    valid_and_positive_y = (
-        (df["Webster_Status"] == "VALID") &
-        (df["Webster_Y"] > 0)
-    )
-
-    df["Webster_Phase_1_Green"] = np.where(
-        valid_and_positive_y,
-        (
-            df["Webster_Available_Green"] *
-            (df["Webster_Phase_1_Ratio"] / df["Webster_Y"])
-        ),
-        np.nan
-    )
-
-    df["Webster_Phase_2_Green"] = np.where(
-        valid_and_positive_y,
-        (
-            df["Webster_Available_Green"] *
-            (df["Webster_Phase_2_Ratio"] / df["Webster_Y"])
-        ),
-        np.nan
-    )
-
-    df["Webster_Phase_1_Green"] = (
-        df["Webster_Phase_1_Green"].round(2)
-    )
-
-    df["Webster_Phase_2_Green"] = (
-        df["Webster_Phase_2_Green"].round(2)
-    )
-
-    df["Cycle_Change_Seconds"] = np.where(
-        df["Webster_Status"] == "VALID",
-        (
-            df["Webster_Optimal_Cycle_Practical"] -
-            df["Baseline_Cycle"]
-        ),
-        np.nan
-    )
-
-    df["Cycle_Change_Seconds"] = (
-        df["Cycle_Change_Seconds"].round(2)
-    )
-
-    if "Phase_1_Baseline_Green" in df.columns:
-        df["Phase_1_Green_Change"] = np.where(
-            df["Webster_Status"] == "VALID",
-            (
-                df["Webster_Phase_1_Green"] -
-                df["Phase_1_Baseline_Green"]
-            ),
-            np.nan
-        )
-        df["Phase_1_Green_Change"] = (
-            df["Phase_1_Green_Change"].round(2)
-        )
-
-    if "Phase_2_Baseline_Green" in df.columns:
-        df["Phase_2_Green_Change"] = np.where(
-            df["Webster_Status"] == "VALID",
-            (
-                df["Webster_Phase_2_Green"] -
-                df["Phase_2_Baseline_Green"]
-            ),
-            np.nan
-        )
-        df["Phase_2_Green_Change"] = (
-            df["Phase_2_Green_Change"].round(2)
-        )
-
-    def get_decision_priority(row):
-
-        webster_status = row["Webster_Status"]
-
-        congestion = str(
-            row.get("Calculated_Congestion_Level", "")
-        ).upper()
-
-        bottleneck = str(
-            row.get("Bottleneck_Status", "")
-        ).upper()
-
-        incident = str(
-            row.get("Incident_Status", "")
-        ).upper()
-
-        peak = str(
-            row.get("Peak_Traffic_Status", "")
-        ).upper()
-
-        if webster_status == "OVERSATURATED":
-            if congestion == "SEVERE" or "SEVERE" in bottleneck:
-                return "CRITICAL"
-            return "HIGH"
-
-        if webster_status in ["INVALID_INPUT", "NO_VALID_DEMAND"]:
-            return "REVIEW_REQUIRED"
-
-        if congestion == "SEVERE":
-            return "HIGH"
-
-        if (
-            congestion == "HIGH" and
-            (
-                "BOTTLENECK" in bottleneck or
-                incident != "NO_INCIDENT" or
-                peak == "PEAK_TRAFFIC"
-            )
-        ):
-            return "HIGH"
-
-        if congestion in ["HIGH", "MODERATE"]:
-            return "MEDIUM"
-
-        return "LOW"
-
-    df["Decision_Priority"] = df.apply(
-        get_decision_priority, axis=1
-    )
-
-    def get_decision_status(row):
-
-        if row["Webster_Status"] == "VALID":
-            return "WEBSTER_TIMING_AVAILABLE"
-        elif row["Webster_Status"] == "OVERSATURATED":
-            return "CAPACITY_OR_NETWORK_REVIEW_REQUIRED"
-        else:
-            return "INPUT_REVIEW_REQUIRED"
-
-    df["Decision_Status"] = df.apply(
-        get_decision_status, axis=1
-    )
-
-    result_columns = []
-
-    id_columns = ["Area_ID", "Intersection_ID"]
-    for column in id_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    original_traffic_columns = [
-        "Traffic_Volume", "Road_Capacity_Utilization_Pct",
-        "Estimated_Road_Capacity", "Average_Speed",
-        "Travel_Time_Index", "Congestion_Level", "Incident_Level"
-    ]
-    for column in original_traffic_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    congestion_columns = [
-        "Capacity_Utilization", "Bottleneck_Status",
-        "Speed_Condition", "Travel_Delay_Condition",
-        "Incident_Status", "Accident_Flag",
-        "Peak_Traffic_Status", "Congestion_Score",
-        "Calculated_Congestion_Level", "Congestion_Reasons"
-    ]
-    for column in congestion_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    lane_columns = ["Estimated_Lanes", "Saturation_Flow"]
-    for column in lane_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    phase_columns = [
-        "Number_of_Phases", "Phase_1_Flow", "Phase_2_Flow",
-        "Phase_1_Flow_Ratio", "Phase_2_Flow_Ratio"
-    ]
-    for column in phase_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    baseline_columns = [
-        "Baseline_Cycle", "Lost_Time", "Available_Green_Time",
-        "Phase_1_Baseline_Green", "Phase_2_Baseline_Green"
-    ]
-    for column in baseline_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    webster_result_columns = [
-        "Webster_Y", "Webster_Status",
-        "Webster_Optimal_Cycle", "Webster_Cycle_Capped",
-        "Webster_Optimal_Cycle_Practical",
-        "Webster_Available_Green",
-        "Webster_Phase_1_Green", "Webster_Phase_2_Green",
-        "Cycle_Change_Seconds"
-    ]
-    for column in webster_result_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    green_change_columns = [
-        "Phase_1_Green_Change", "Phase_2_Green_Change"
-    ]
-    for column in green_change_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    decision_columns = ["Decision_Priority", "Decision_Status"]
-    for column in decision_columns:
-        if column in df.columns:
-            result_columns.append(column)
-
-    result_columns = list(dict.fromkeys(result_columns))
-
-    webster_results = df[result_columns].copy()
-
-    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    webster_results.to_csv(OUTPUT_FILE, index=False)
-
-    print("\n" + "=" * 70)
-    print("WEBSTER RESULTS CREATED SUCCESSFULLY")
-    print("=" * 70)
-
-    print("\nOutput file:")
-    print(OUTPUT_FILE)
-
-    print("\nTotal rows:")
-    print(len(webster_results))
-
-    print("\nWebster Status Summary:")
-    print(webster_results["Webster_Status"].value_counts(dropna=False))
-
-    if "Webster_Cycle_Capped" in webster_results.columns:
-        capped_count = webster_results["Webster_Cycle_Capped"].sum()
-        print(
-            f"\nRows with cycle capped at {MAX_PRACTICAL_CYCLE}s "
-            f"(near-saturation, Y close to 1): {capped_count}"
-        )
-
-    print("\nDecision Priority Summary:")
-    print(webster_results["Decision_Priority"].value_counts(dropna=False))
-
-    print("\nFirst 5 Webster Results:")
-
-    display_columns = [
-        "Area_ID", "Intersection_ID", "Calculated_Congestion_Level",
-        "Webster_Y", "Webster_Status", "Baseline_Cycle",
-        "Webster_Optimal_Cycle_Practical", "Webster_Phase_1_Green",
-        "Webster_Phase_2_Green", "Decision_Priority", "Decision_Status"
-    ]
-
-    display_columns = [
-        column for column in display_columns
-        if column in webster_results.columns
-    ]
-
-    print(webster_results[display_columns].head())
-
-    print("\nSUCCESS!")
-    print("webster_results_full.csv is ready for simulation.py")
-
-if __name__ == "__main__":
-
-    try:
-        main()
-    except Exception as error:
-        print("\n" + "=" * 70)
-        print("SCRIPT FAILED")
-        print("=" * 70)
-        print(f"\nError: {error}")
-        raise

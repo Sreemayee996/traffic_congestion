@@ -1,0 +1,14 @@
+{
+  "congestion_model": {
+    "mae": 0.435,
+    "r2": 0.996,
+    "n_train": 7148,
+    "n_test": 1788
+  },
+  "risk_model": {
+    "roc_auc": 0.845,
+    "positive_rate_train": 0.732,
+    "n_train": 7148,
+    "n_test": 1788
+  }
+}

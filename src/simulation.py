@@ -18,7 +18,6 @@ from .data_preprocessing import get_location_catalog, load_clean
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 
-
 class TrafficAnalyzer:
     def __init__(self, csv_path: str, model_dir: str = MODEL_DIR, load_ml: bool = True):
         self.csv_path = csv_path
@@ -33,9 +32,6 @@ class TrafficAnalyzer:
         if load_ml:
             self._try_load_ml()
 
-    # ------------------------------------------------------------------
-    # ML lifecycle
-    # ------------------------------------------------------------------
     def _try_load_ml(self) -> None:
         try:
             self.congestion_model, self.risk_model = ml_models.load_models(self.model_dir)
@@ -57,9 +53,6 @@ class TrafficAnalyzer:
     def ml_ready(self) -> bool:
         return self.congestion_model is not None and self.risk_model is not None
 
-    # ------------------------------------------------------------------
-    # Locations
-    # ------------------------------------------------------------------
     def list_locations(self) -> list[dict]:
         return self.location_catalog.to_dict(orient="records")
 
@@ -74,34 +67,27 @@ class TrafficAnalyzer:
                 f"Call /api/locations for valid values."
             )
 
-    # ------------------------------------------------------------------
-    # Congestion score
-    # ------------------------------------------------------------------
     def congestion_score(self, area: str, road: str) -> dict:
         self._validate_location(area, road)
         return scoring.location_summary(self.data, area, road)
 
-    # ------------------------------------------------------------------
-    # Bottlenecks
-    # ------------------------------------------------------------------
     def bottlenecks(self, top_n: int = 10) -> list[dict]:
         ranking = scoring.bottleneck_ranking(self.data, top_n=top_n)
         return ranking.to_dict(orient="records")
 
-    # ------------------------------------------------------------------
-    # Signal timing (Webster's method)
-    # ------------------------------------------------------------------
-    def signal_timing(self, area: str, road: str, num_phases: int = 4, lanes_per_phase: int = 2) -> dict:
+    def signal_timing(self, area: str, road: str, num_phases: int = 4, lanes_per_phase: int = 2,
+                       peak_hour_factor: float = 0.09) -> dict:
         self._validate_location(area, road)
         subset = self.data[
             (self.data["Area Name"].str.lower() == area.lower())
             & (self.data["Road/Intersection Name"].str.lower() == road.lower())
         ]
-        avg_volume = float(subset["Traffic Volume"].mean())
+        avg_daily_volume = float(subset["Traffic Volume"].mean())
+        avg_peak_hour_volume = avg_daily_volume * peak_hour_factor
         avg_utilization = float(subset["Road Capacity Utilization"].mean())
 
         result = webster.estimate_signal_timing(
-            traffic_volume_vph=avg_volume,
+            traffic_volume_vph=avg_peak_hour_volume,
             road_capacity_utilization_pct=avg_utilization,
             num_phases=num_phases,
             lanes_per_phase=lanes_per_phase,
@@ -110,14 +96,13 @@ class TrafficAnalyzer:
         out.update({
             "area": area,
             "road": road,
-            "avg_daily_traffic_volume": round(avg_volume, 1),
+            "avg_daily_traffic_volume": round(avg_daily_volume, 1),
+            "peak_hour_factor": peak_hour_factor,
+            "estimated_peak_hour_volume": round(avg_peak_hour_volume, 1),
             "avg_road_capacity_utilization_pct": round(avg_utilization, 1),
         })
         return out
 
-    # ------------------------------------------------------------------
-    # Accident risk
-    # ------------------------------------------------------------------
     def accident_risk(self, area: str, road: str) -> dict:
         self._validate_location(area, road)
         summary = scoring.location_summary(self.data, area, road)
@@ -130,9 +115,6 @@ class TrafficAnalyzer:
             "historical_avg_incident_reports": summary["historical_avg_incident_reports"],
         }
 
-    # ------------------------------------------------------------------
-    # Combined dashboard payload
-    # ------------------------------------------------------------------
     def full_report(self, area: str, road: str) -> dict:
         self._validate_location(area, road)
         report = {
@@ -142,9 +124,6 @@ class TrafficAnalyzer:
         }
         return report
 
-    # ------------------------------------------------------------------
-    # AI predictions (forward-looking, no live sensor needed)
-    # ------------------------------------------------------------------
     def predict(self, area: str, road: str, weather: str = "Clear", roadwork: str = "No",
                 month: int = 6, day_of_week: int = 2) -> dict:
         self._validate_location(area, road)
